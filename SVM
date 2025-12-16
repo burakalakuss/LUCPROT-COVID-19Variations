@@ -1,0 +1,127 @@
+# ===============================================================
+# LUCPROT + SVM Model for COVID-19 Variant Classification
+# ===============================================================
+
+from Bio import Entrez
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from tensorflow.keras.utils import to_categorical
+
+# ===============================================================
+# 1. CONFIGURE NCBI ENTREZ (Protein Sequences)
+# ===============================================================
+
+Entrez.email = "your_email@example.com"  # required by NCBI policy
+search_term = "SARS-CoV-2[Organism] AND variant[Title] AND protein"
+
+handle = Entrez.esearch(db="protein", term=search_term, retmax=100)
+record = Entrez.read(handle)
+protein_ids = record["IdList"]
+
+sequences = []
+labels = []
+
+for pid in protein_ids:
+    fetch = Entrez.efetch(db="protein", id=pid, rettype="fasta", retmode="text")
+    fasta_data = fetch.read()
+    fetch.close()
+
+    seq_lines = [line.strip() for line in fasta_data.split("\n") if line and not line.startswith(">")]
+    seq = "".join(seq_lines)
+    if seq:
+        sequences.append(seq)
+        labels.append("variant")  # or label non-variant if your dataset includes both types
+
+print(f"Fetched {len(sequences)} protein sequences from NCBI.")
+
+# ===============================================================
+# 2. LUCPROT ENCODING
+# ===============================================================
+
+def lucas_sequence(n):
+    """Generate Lucas sequence up to n terms."""
+    L = [2, 1]
+    for i in range(2, n):
+        L.append(L[-1] + L[-2])
+    return L[:n]
+
+def lucprot_encode(sequence):
+    """Convert amino acid sequence to numeric representation using LUCPROT encoding."""
+    amino_acids = sorted(list("ACDEFGHIKLMNPQRSTVWY"))
+    lucas_vals = lucas_sequence(len(amino_acids))
+    mapping = dict(zip(amino_acids, lucas_vals))
+    return [mapping[aa] for aa in sequence if aa in mapping]
+
+encoded_sequences = [lucprot_encode(seq) for seq in sequences]
+max_len = max(len(seq) for seq in encoded_sequences)
+X = np.array([np.pad(seq, (0, max_len - len(seq))) for seq in encoded_sequences])
+y = np.array(labels)
+
+# ===============================================================
+# 3. DATA PREPROCESSING
+# ===============================================================
+
+scaler = MinMaxScaler()
+X_scaled = scaler.fit_transform(X)
+
+encoder = LabelEncoder()
+y_encoded = encoder.fit_transform(y)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+)
+
+# ===============================================================
+# 4. SVM MODEL + GRID SEARCH
+# ===============================================================
+
+# Parameter grid (based on your table)
+param_grid = {
+    "C": [1.0, 2.0, 3.0, 4.0, 5.0],
+    "kernel": ["linear", "rbf", "poly", "sigmoid"],
+    "tol": [0.0001, 0.001, 0.01, 0.03, 0.05, 0.1]
+}
+
+svm = SVC(probability=True)
+
+grid = GridSearchCV(
+    estimator=svm,
+    param_grid=param_grid,
+    scoring="accuracy",
+    cv=5,
+    n_jobs=-1,
+    verbose=1
+)
+
+grid.fit(X_train, y_train)
+best_svm = grid.best_estimator_
+
+print("Best Parameters:", grid.best_params_)
+
+# ===============================================================
+# 5. MODEL EVALUATION
+# ===============================================================
+
+y_pred = best_svm.predict(X_test)
+y_prob = best_svm.predict_proba(X_test)
+
+acc = accuracy_score(y_test, y_pred)
+prec = precision_score(y_test, y_pred, average="macro")
+rec = recall_score(y_test, y_pred, average="macro")
+f1 = f1_score(y_test, y_pred, average="macro")
+
+try:
+    auc = roc_auc_score(to_categorical(y_test), y_prob, multi_class="ovr", average="macro")
+except Exception:
+    auc = np.nan
+
+print("\n=== SVM Performance (LUCPROT + NCBI Protein Data) ===")
+print(f"Accuracy : {acc:.4f}")
+print(f"Precision: {prec:.4f}")
+print(f"Recall   : {rec:.4f}")
+print(f"F1-Score : {f1:.4f}")
+print(f"AUC      : {auc:.4f}")
