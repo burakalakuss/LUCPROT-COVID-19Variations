@@ -1,0 +1,166 @@
+# ===============================================================
+# LUCPROT + BiLSTM Model for COVID-19 Variant Classification
+# ===============================================================
+
+from Bio import Entrez
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Bidirectional, LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam, SGD, RMSprop
+from tensorflow.keras.utils import to_categorical
+
+# ===============================================================
+# 1. FETCH NCBI DATA
+# ===============================================================
+
+Entrez.email = "your_email@example.com"
+search_term = "SARS-CoV-2[Organism] AND variant[Title] AND protein"
+
+handle = Entrez.esearch(db="protein", term=search_term, retmax=50)
+record = Entrez.read(handle)
+protein_ids = record["IdList"]
+
+sequences, labels = [], []
+for pid in protein_ids:
+    fetch = Entrez.efetch(db="protein", id=pid, rettype="fasta", retmode="text")
+    fasta_data = fetch.read()
+    fetch.close()
+    seq_lines = [line.strip() for line in fasta_data.split("\n") if line and not line.startswith(">")]
+    seq = "".join(seq_lines)
+    if seq:
+        sequences.append(seq)
+        labels.append("variant")
+
+# ===============================================================
+# 2. LUCPROT ENCODING
+# ===============================================================
+
+def lucas_sequence(n):
+    L = [2, 1]
+    for i in range(2, n):
+        L.append(L[-1] + L[-2])
+    return L[:n]
+
+def lucprot_encode(sequence):
+    amino_acids = sorted(list("ACDEFGHIKLMNPQRSTVWY"))
+    lucas_vals = lucas_sequence(len(amino_acids))
+    mapping = dict(zip(amino_acids, lucas_vals))
+    return [mapping[aa] for aa in sequence if aa in mapping]
+
+encoded_sequences = [lucprot_encode(seq) for seq in sequences]
+max_len = max(len(seq) for seq in encoded_sequences)
+X = np.array([np.pad(seq, (0, max_len - len(seq))) for seq in encoded_sequences])
+y = np.array(labels)
+
+# ===============================================================
+# 3. PREPROCESSING
+# ===============================================================
+
+scaler = MinMaxScaler()
+X_scaled = scaler.fit_transform(X)
+
+encoder = LabelEncoder()
+y_encoded = encoder.fit_transform(y)
+num_classes = len(np.unique(y_encoded))
+y_cat = to_categorical(y_encoded, num_classes)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y_cat, test_size=0.2, random_state=42, stratify=y_cat
+)
+
+X_train = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
+X_test = X_test.reshape((X_test.shape[0], X_test.shape[1], 1))
+
+# ===============================================================
+# 4. DEFINE GRID RANGES (STEP=1)
+# ===============================================================
+
+param_ranges = {
+    "epochs": list(range(10, 1001, 1)),         # [10–1000]
+    "batch_size": list(range(2, 129, 1)),       # [2–128]
+    "lstm_units": list(range(4, 129, 1)),       # [4–128]
+    "bilstm_units": list(range(64, 257, 1)),    # [64–256]
+    "dropout": np.arange(0.10, 0.31, 0.01).round(2).tolist(),  # [0.10–0.30]
+    "optimizer": ["adam", "sgd", "rmsprop"],
+    "activation": ["sigmoid", "relu", "selu"]
+}
+
+print("Parameter space defined with step=1 for integer ranges.")
+for k, v in param_ranges.items():
+    print(f"{k}: {v[:5]} ... {v[-5:] if len(v)>5 else v}")
+
+# ===============================================================
+# 5. BILSTM MODEL (Example use)
+# ===============================================================
+
+def create_bilstm_model(bilstm_units=128, lstm_units=32, dropout_rate=0.25, activation="selu", optimizer="adam"):
+    model = Sequential([
+        Bidirectional(LSTM(bilstm_units, activation=activation)),
+        Dropout(dropout_rate),
+        Dense(lstm_units, activation=activation),
+        Dense(num_classes, activation="sigmoid" if num_classes == 2 else "softmax")
+    ])
+    opt = Adam(learning_rate=0.001) if optimizer == "adam" else \
+          SGD(learning_rate=0.001) if optimizer == "sgd" else \
+          RMSprop(learning_rate=0.001)
+    model.compile(optimizer=opt,
+                  loss="binary_crossentropy" if num_classes == 2 else "categorical_crossentropy",
+                  metrics=["accuracy"])
+    return model
+
+# ===============================================================
+# 6. TRAIN BEST COMBINATION (for demonstration)
+# ===============================================================
+
+# Using the best parameters manually (e.g., found via grid search externally)
+best_params = {
+    "epochs": 700,
+    "batch_size": 64,
+    "bilstm_units": 128,
+    "lstm_units": 32,
+    "dropout_rate": 0.25,
+    "activation": "selu",
+    "optimizer": "adam"
+}
+
+model = create_bilstm_model(**{k:v for k,v in best_params.items() if k in ["bilstm_units","lstm_units","dropout_rate","activation","optimizer"]})
+history = model.fit(X_train, y_train, validation_split=0.2,
+                    epochs=best_params["epochs"], batch_size=best_params["batch_size"], verbose=1)
+
+# ===============================================================
+# 7. EVALUATION
+# ===============================================================
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+import matplotlib.pyplot as plt
+
+y_prob = model.predict(X_test)
+y_pred = np.argmax(y_prob, axis=1)
+y_true = np.argmax(y_test, axis=1)
+
+acc = accuracy_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred, average="macro")
+rec = recall_score(y_true, y_pred, average="macro")
+f1 = f1_score(y_true, y_pred, average="macro")
+auc_score = roc_auc_score(y_test, y_prob, multi_class="ovr", average="macro")
+
+print(f"\nAccuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f} | AUC: {auc_score:.4f}")
+
+# ===============================================================
+# 8. ROC CURVE
+# ===============================================================
+
+if num_classes == 2:
+    fpr, tpr, _ = roc_curve(y_test[:, 1], y_prob[:, 1])
+    plt.figure(figsize=(7,6))
+    plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {auc_score:.3f})")
+    plt.plot([0,1],[0,1], color="navy", lw=2, linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve - BiLSTM (Step=1 parameter definition)")
+    plt.legend(loc="lower right")
+    plt.show()
+else:
+    print("ROC curve only plotted for binary classification.")
